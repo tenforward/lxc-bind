@@ -180,8 +180,6 @@ EOF
     return 0
 }
 
-exec="/bin/bash"
-
 options=$(getopt -o hp:n:e:b: -l help,rootfs:,path:,name:,exec:,bind: -- "$@")
 if [ $? -ne 0 ]; then
         usage $(basename $0)
@@ -204,6 +202,10 @@ done
 
 exec_cmd=$1 ; shift 1
 exec="$*"
+
+if [ -z $exec_cmd ]; then
+    exec_cmd="/bin/bash"
+fi
 
 if [ "$(id -u)" != "0" ]; then
     echo "This script should be run as 'root'"

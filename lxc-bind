@@ -1,0 +1,255 @@
+#!/bin/bash
+
+# Authors:
+# KATOH Yasufumi <karma@jazz.email.ne.jp>
+
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public
+# License as published by the Free Software Foundation; either
+# version 2.1 of the License, or (at your option) any later version.
+
+# This library is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# Lesser General Public License for more details.
+
+# You should have received a copy of the GNU Lesser General Public
+# License along with this library; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+
+# Detect use under userns (unsupported)
+for arg in "$@"; do
+    [ "$arg" = "--" ] && break
+    if [ "$arg" = "--mapped-uid" -o "$arg" = "--mapped-gid" ]; then
+        echo "This template can't be used for unprivileged containers." 1>&2
+        echo "You may want to try the \"download\" template instead." 1>&2
+        exit 1
+    fi
+done
+
+# Make sure the usual locations are in PATH
+export PATH=$PATH:/usr/sbin:/usr/bin:/sbin:/bin
+
+newdirs="\
+proc \
+sys \
+sys/fs/cgroup \
+etc \
+run \
+home \
+root \
+usr \
+var/log"
+
+binddirs="\
+etc/init.d \
+etc/rc.d \
+etc/sysconfig/network-scripts \
+etc/alternatives \
+etc/pki/tls/certs \
+etc/ssl/certs \
+dev \
+run \
+bin \
+sbin \
+usr \
+lib \
+lib64"
+
+tempdirs="\
+tmp \
+run/lock \
+var/tmp"
+
+copyfiles="\
+etc/passwd \
+etc/group"
+
+install_fs()
+{
+    rootfs=$1
+
+    for d in $newdirs $binddirs $tempdirs
+    do
+        mkdir -p $rootfs/$d
+        if [ $? -ne 0 ]; then
+            return 1
+        fi
+    done
+
+    return 0
+}
+
+configure_fs()
+{
+    rootfs=$1
+
+    for f in $copyfiles
+    do
+        cp /$f $rootfs/$f
+    done
+}
+
+copy_configuration()
+{
+    path=$1
+    rootfs=$2
+    name=$3
+    bind=$4
+
+    grep -q "^lxc.rootfs" $path/config 2>/dev/null || echo "lxc.rootfs = $rootfs" >> $path/config
+    cat <<EOF >> $path/config
+lxc.utsname = $name
+lxc.pts = 1024
+lxc.cap.drop = sys_module mac_admin mac_override sys_time
+lxc.mount.auto = cgroup:mixed proc:mixed sys:mixed
+EOF
+    for d in $binddirs
+    do
+        if [ -d /$d ]; then
+            cat <<EOF >> $path/config
+lxc.mount.entry = /$d $d none ro,bind 0 0
+EOF
+        fi
+    done
+
+    cat <<EOF >> $path/config
+lxc.mount.entry = $path/init sbin/init none ro,bind 0 0
+EOF
+
+    if [ ! -z $bind ]; then
+        bind=`echo $bind | sed -e 's%^/%%'`
+        cat <<EOF >> $path/config
+lxc.mount.entry = /$bind $bind none ro,bind 0 0
+EOF
+    fi
+
+    # if no .ipv4 section in config, then have the container run dhcp
+    grep -q "^lxc.network.ipv4" $path/config || touch $rootfs/run-dhcp
+
+}
+
+usage()
+{
+    cat <<EOF
+$1 -h|--help -p|--path=<path> [--rootfs=<path>]
+EOF
+    return 0
+}
+
+check_for_cmd()
+{
+    cmd_path=`type $1`
+    if [ $? -ne 0 ]; then
+        echo "The command '$1' $cmd_path is not accessible on the system"
+        exit 1
+    fi
+    # we use cut instead of awk because awk is alternatives symlink on ubuntu
+    # and /etc/alternatives isn't bind mounted
+    cmd_path=`echo $cmd_path |cut -d ' ' -f 3`
+}
+
+gen_init()
+{
+    path=$1
+    exec_cmd=$2
+    exec_args=$3
+
+    check_for_cmd /usr/sbin/init.lxc
+    check_for_cmd dhclient
+    dhclient_path=$cmd_path
+    check_for_cmd $exec_cmd
+    exec_path=$cmd_path
+    check_for_cmd ip
+    ip_path=$cmd_path
+
+    cat <<EOF > $path/init
+if [ -f /run-dhcp ]; then
+  rm -f /dhclient.conf
+  cat > /dhclient.conf << EOF2
+send host-name = gethostname();
+EOF2
+  $ip_path link set eth0 up
+  $dhclient_path eth0 -cf /dhclient.conf -v
+fi
+
+exec /usr/sbin/init.lxc -- $exec_path $exec_args
+exit 1
+EOF
+    chmod 755 $path/init
+    return 0
+}
+
+exec="/bin/bash"
+
+options=$(getopt -o hp:n:e:b: -l help,rootfs:,path:,name:,exec:,bind: -- "$@")
+if [ $? -ne 0 ]; then
+        usage $(basename $0)
+    exit 1
+fi
+eval set -- "$options"
+
+while true
+do
+    case "$1" in
+        -h|--help)      usage $0 && exit 0;;
+        -p|--path)      path=$2; shift 2;;
+        --rootfs)       rootfs=$2; shift 2;;
+        -n|--name)      name=$2; shift 2;;
+        -b|--bind)      bind=$2; shift 2;;
+        --)             shift 1; break ;;
+        *)              break ;;
+    esac
+done
+
+exec_cmd=$1 ; shift 1
+exec="$*"
+
+if [ "$(id -u)" != "0" ]; then
+    echo "This script should be run as 'root'"
+    exit 1
+fi
+
+if [ -z "$path" ]; then
+    echo "'path' parameter is required"
+    exit 1
+fi
+
+if [ -z "$name" ]; then
+    echo "'name' parameter is required"
+    exit 1
+fi
+
+# detect rootfs
+config="$path/config"
+if [ -z "$rootfs" ]; then
+    if grep -q '^lxc.rootfs' $config 2>/dev/null ; then
+        rootfs=$(awk -F= '/^lxc.rootfs =/{ print $2 }' $config)
+    else
+        rootfs=$path/rootfs
+    fi
+fi
+
+install_fs $rootfs
+if [ $? -ne 0 ]; then
+    echo "failed to install sshd's rootfs"
+    exit 1
+fi
+
+configure_fs $rootfs
+if [ $? -ne 0 ]; then
+    echo "failed to configure sshd template"
+    exit 1
+fi
+
+copy_configuration $path $rootfs $name $bind
+if [ $? -ne 0 ]; then
+    echo "failed to write configuration file"
+    exit 1
+fi
+
+gen_init $path $exec_cmd "$exec"
+if [ $? -ne 0 ]; then
+    echo "failed to create init file"
+    exit 1
+fi
